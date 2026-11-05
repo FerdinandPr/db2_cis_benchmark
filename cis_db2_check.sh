@@ -100,8 +100,30 @@ db_cfg() {  # DB-Konfigurationsparameter (Datenbankebene)
   '
 }
 
-q() {  # SQL-Abfrage (db2 -x, ohne Spaltenkoepfe); braucht bestehende Verbindung
-  db2 -x "$1" 2>/dev/null
+q() {  # SQL-Abfrage gegen die Zieldatenbank.
+  # Hintergrund: CLP-Verbindungen sind PRO SHELL-PROZESS (db2bp-Backend). In
+  # $( )-Subshells ist eine im Hauptskript aufgebaute Verbindung nicht sichtbar
+  # (SQL1024N). Mehrere CLP-Befehle in EINEM Argumentstring sind ebenfalls nicht
+  # moeglich. Deshalb laufen CONNECT und Abfrage als EIN db2-Prozess ueber ein
+  # Skript-File (-tf) — garantiert in derselben CLP-Sitzung, unabhaengig von
+  # Shell- und Backend-Semantik.
+  printf 'connect to %s;\n%s;\n' "$DB" "$1" >"$QSQL"
+  db2 -x -tf "$QSQL" >"$QOUT" 2>/dev/null
+  # Stoerausgaben entfernen: CONNECT-Banner (bis 'Local database alias') und
+  # DB2-Hinweismeldungen (DB20000I etc.)
+  sed -i -e '/Database Connection Information/,/^ *Local database alias/d' -e '/^DB[0-9]*[IEWN] /d' "$QOUT" 2>/dev/null
+  if grep -qE 'SQL[0-9]{4}N' "$QOUT" 2>/dev/null; then
+    printf 'SQL-Fehler: %s\n' "$(grep -m1 -E 'SQL[0-9]{4}N' "$QOUT")" >&2
+    : >"$QOUT"
+    return 1
+  fi
+  cat "$QOUT"
+}
+
+cnt_query() {  # COUNT-Abfrage -> Zahl; -1 wenn Ergebnis nicht auswertbar
+  local n
+  n=$(trim "$(q "$1")")
+  if is_num "$n"; then printf '%s' "$n"; else printf '%s' '-1'; fi
 }
 
 mode_of()  { stat -Lc '%a' "$1" 2>/dev/null; }
@@ -208,6 +230,12 @@ if [ -n "$REPORT_FILE" ]; then
   exec > >(tee "$REPORT_FILE") 2>&1
 fi
 
+# Temporaere Dateien fuer die SQL-Abfragen (CLP-Sitzung in q(), siehe oben)
+QSQL="${TMPDIR:-/tmp}/cisdb2q.$$"
+QOUT="${TMPDIR:-/tmp}/cisdb2o.$$"
+: >"$QSQL" 2>/dev/null || exit 2
+: >"$QOUT" 2>/dev/null || exit 2
+
 # -------------------------------- Preflight ---------------------------------
 sec "0 Preflight"
 
@@ -237,6 +265,14 @@ if [ -n "$DB" ]; then
   if db2 connect to "$DB" >/dev/null 2>&1; then
     DB_LEVEL=1
     echo "Datenbank    : $DB (verbunden)"
+    # SQL-Canary: prueft, ob SQL-Abfragen aus Subshells funktionieren
+    n=$(trim "$(q "SELECT COUNT(*) FROM SYSIBM.SYSDUMMY1")")
+    if is_num "$n"; then
+      echo "SQL-Canary   : ok (SYSDUMMY1 erreichbar)"
+    else
+      DB_LEVEL=0
+      record WARN "0" "SQL-Canary fehlgeschlagen — Datenbank-Pruefungen werden uebersprungen"
+    fi
   else
     echo "Datenbank    : $DB — Verbindung fehlgeschlagen, DB-Checks werden uebersprungen"
   fi
@@ -383,8 +419,10 @@ sec "4 Datenbankkonfiguration (4.1 DB CFG, 4.2-4.5 Katalog)"
 if [ "$DB_LEVEL" -eq 1 ]; then
 
   # 4.1.1 Creating the Database Without PUBLIC Grants (RESTRICTIVE)
-  n=$(trim "$(q "SELECT COUNT(*) FROM SYSCAT.DBAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")")
-  if is_num "$n" && [ "$n" -eq 0 ]; then
+  n=$(cnt_query "SELECT COUNT(*) FROM SYSCAT.DBAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")
+  if [ "$n" -lt 0 ]; then
+    record WARN "4.1.1" "Abfrage nicht auswertbar — PUBLIC-Grants manuell pruefen"
+  elif [ "$n" -eq 0 ]; then
     record PASS "4.1.1" "Keine PUBLIC-Privilegien auf DB-Ebene (RESTRICTIVE)"
   else
     list=$(q "SELECT RTRIM(PRIVILEGE) FROM SYSCAT.DBAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'" | list_inline)
@@ -474,8 +512,10 @@ if [ "$DB_LEVEL" -eq 1 ]; then
   fi
 
   # 4.5.1 Restrict Access to Tablespaces
-  n=$(trim "$(q "SELECT COUNT(*) FROM SYSCAT.TBSPACEAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")")
-  if is_num "$n" && [ "$n" -eq 0 ]; then
+  n=$(cnt_query "SELECT COUNT(*) FROM SYSCAT.TBSPACEAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")
+  if [ "$n" -lt 0 ]; then
+    record WARN "4.5.1" "Abfrage nicht auswertbar — Tablespace-Grants manuell pruefen"
+  elif [ "$n" -eq 0 ]; then
     record PASS "4.5.1" "Keine PUBLIC-Grants auf Tablespaces"
   else
     record FAIL "4.5.1" "$n PUBLIC-Grants auf Tablespaces — USE-Privilegien fuer PUBLIC entfernen"
@@ -555,8 +595,10 @@ if [ "$DB_LEVEL" -eq 1 ]; then
   fi
 
   # 6.2.5 Rollen fuer PUBLIC
-  n=$(trim "$(q "SELECT COUNT(*) FROM SYSCAT.ROLEAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")")
-  if is_num "$n" && [ "$n" -gt 0 ]; then
+  n=$(cnt_query "SELECT COUNT(*) FROM SYSCAT.ROLEAUTH WHERE GRANTEE='PUBLIC' AND GRANTEETYPE='G'")
+  if [ "$n" -lt 0 ]; then
+    record WARN "6.2.5" "Abfrage nicht auswertbar — Rollen an PUBLIC manuell pruefen"
+  elif [ "$n" -gt 0 ]; then
     record WARN "6.2.5" "$n an PUBLIC vergebene Rollen — Review erforderlich"
   else
     record PASS "6.2.5" "Keine Rollen an PUBLIC vergeben"
@@ -576,8 +618,10 @@ check_reg_unset "7.1.2" "DB2_LIMIT_AUDIT_APPS" "Limitierte Anwendungs-Auditierun
 
 if [ "$DB_LEVEL" -eq 1 ]; then
   # 7.1.3 Ensure Audit Policies are Enabled Within the Database (Manual)
-  n=$(trim "$(q "SELECT COUNT(*) FROM SYSCAT.AUDITUSE")")
-  if is_num "$n" && [ "$n" -gt 0 ]; then
+  n=$(cnt_query "SELECT COUNT(*) FROM SYSCAT.AUDITUSE")
+  if [ "$n" -lt 0 ]; then
+    record WARN "7.1.3" "Abfrage nicht auswertbar — Audit-Policies manuell pruefen"
+  elif [ "$n" -gt 0 ]; then
     record PASS "7.1.3" "$n aktive Audit-Policies laut SYSCAT.AUDITUSE"
   else
     record WARN "7.1.3" "Keine aktiven Audit-Policies — Audit-Policies anlegen (Benchmark 7.1.3)"
@@ -688,5 +732,6 @@ echo "Konformitaets-Score (PASS/(PASS+FAIL)): ${score}%"
 echo "Referenz: CIS IBM Db2 11 Benchmark v1.2.0 / CIS IBM Db2 12.1 Benchmark v1.0.0"
 echo "WARN/INFO-Befunde sind manuell bzw. gegen das offizielle CIS-PDF zu bewerten."
 
-db2 connect reset >/dev/null 2>&1 || true
+rm -f "$QSQL" "$QOUT" 2>/dev/null
+db2 terminate >/dev/null 2>&1 || true
 [ "$FAIL_CNT" -eq 0 ] && exit 0 || exit 1
